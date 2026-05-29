@@ -52,48 +52,18 @@ from matplotlib.patches import Patch
 from scipy import stats as sp_stats
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-# Add DLPMI package root to path
-sys.path.insert(0, os.path.join(_HERE, '..', '..'))
-
-from dlpmi.tracers    import LAMBDA_3H, LAMBDA_14C
-from dlpmi.kernels    import AGES_YOUNG, AGES_OLD, g_DM, choose_ages
-from dlpmi.forward    import forward_single as _fwd_single
-from dlpmi.forward    import forward_BMM
-from dlpmi.uncertainty import (chi2_probability, hessian_uncertainty,
-                                profile_uncertainty, mc_uncertainty)
-
-# Local compatibility shims so existing Edwards code still runs unchanged
-from dlpmi.params   import DLPMIModel as PINN_DM, BMMModel as PINN_BMM
-
-def forward_DM(tau, PD, sample_date, tracer_list, scale_list,
-               he4_rate=1e-12, ages=None, dgmeta=None):
-    return _fwd_single("DM", {"tau": tau, "PD": PD},
-                        sample_date, tracer_list, scale_list,
-                        he4_rate, ages, dgmeta)
-
-def chi2_loss(sims, obs_vals):
-    import torch
-    loss = torch.tensor(0.)
-    for s, o in zip(sims, obs_vals):
-        loss = loss + ((s - float(o)) / (abs(float(o)) + 1e-30))**2
-    return loss
-
-def train_pinn(model, loss_fn, n_adam=5000, lr_adam=3e-3, lr_lbfgs=0.02):
-    import torch.optim as optim
-    opt   = optim.Adam(model.parameters(), lr=lr_adam)
-    sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_adam, eta_min=1e-5)
-    hist  = []
-    for _ in range(n_adam):
-        opt.zero_grad(); L = loss_fn(); L.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.)
-        opt.step(); sched.step(); hist.append(L.item())
-    opt2 = optim.LBFGS(model.parameters(), lr=lr_lbfgs, max_iter=300,
-                        history_size=20, line_search_fn="strong_wolfe")
-    def closure():
-        opt2.zero_grad(); Lv = loss_fn(); Lv.backward()
-        hist.append(Lv.item()); return Lv
-    opt2.step(closure)
-    return hist
+sys.path.insert(0, _HERE)
+from edwards_pinn_physics import (
+    LAMBDA_3H, LAMBDA_14C,
+    AGES_YOUNG, AGES_OLD,
+    g_DM, forward_DM, forward_BMM,
+    chi2_loss, train_pinn,
+    PINN_DM, PINN_BMM,
+    chi2_probability,
+    hessian_uncertainty,
+    profile_uncertainty,
+    mc_uncertainty,
+)
 
 warnings.filterwarnings("ignore")
 torch.set_default_dtype(torch.float32)
@@ -104,8 +74,8 @@ try:
 except AttributeError:
     _trapz = np.trapz
 
-_CONFIG_DEFAULT = os.path.join(_HERE, "edwards_input_config.json")  # same directory as this script
-_OUT_DIR        = os.path.join(_HERE, "results", "edwards_pinn")
+_CONFIG_DEFAULT = os.path.join(_HERE, "edwards_input_config.json")
+_OUT_DIR        = os.path.join(_HERE, "edwards_pinn")
 
 BLUE="#2b6cb0"; RED="#c0392b"; ORG="#e07b00"
 TEAL="#2c7a6e"; PUR="#6a3fa1"; GRY="#555555"; GRN="#276221"
@@ -801,17 +771,25 @@ def plot_summary(all_results, out_dir):
                 if "tau1" in pn:
                     idx = pn.index("tau1")
                     if idx < len(sg) and sg[idx] is not None:
-                        ax.errorbar(pinn_v[i], y[i]-0.20,
-                                    xerr=[[min(sg[idx],pinn_v[i]*0.99)],[sg[idx]]],
-                                    fmt="none", ecolor="black", capsize=3, lw=1.2,
-                                    zorder=5)
+                        sigma = float(sg[idx]) if sg[idx] is not None else 0.
+                        sigma = abs(sigma)  # guard against negative/NaN
+                        lo_err = max(min(sigma, pinn_v[i] * 0.99), 0.)
+                        hi_err = max(sigma, 0.)
+                        if lo_err > 0 or hi_err > 0:
+                            ax.errorbar(pinn_v[i], y[i]-0.20,
+                                        xerr=[[lo_err],[hi_err]],
+                                        fmt="none", ecolor="black",
+                                        capsize=3, lw=1.2, zorder=5)
                 # MC error bars (P16-P84)
                 mc = r.get("unc_mc",{}).get("tau1",{})
-                if mc.get("p16") and mc.get("p84"):
-                    ax.errorbar(pinn_v[i], y[i]-0.20,
-                                xerr=[[pinn_v[i]-mc["p16"]],[mc["p84"]-pinn_v[i]]],
-                                fmt="none", ecolor=TEAL, capsize=2, lw=0.8,
-                                alpha=0.6, zorder=4)
+                if mc.get("p16") is not None and mc.get("p84") is not None:
+                    mc_lo = max(pinn_v[i] - float(mc["p16"]), 0.)
+                    mc_hi = max(float(mc["p84"]) - pinn_v[i], 0.)
+                    if mc_lo > 0 or mc_hi > 0:
+                        ax.errorbar(pinn_v[i], y[i]-0.20,
+                                    xerr=[[mc_lo],[mc_hi]],
+                                    fmt="none", ecolor=TEAL, capsize=2, lw=0.8,
+                                    alpha=0.6, zorder=4)
 
         ax.set_yticks(y); ax.set_yticklabels(sids, fontsize=6.8)
         ax.set_xlabel(xlabel, fontsize=10); ax.set_title(title, fontsize=12, fontweight="bold")

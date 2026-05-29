@@ -2,9 +2,11 @@ from setuptools import setup, find_packages
 
 setup(
     name             = "dlpmi",
-    version          = "1.0.0",
-    description      = ("Differentiable LPM Inversion — open-source Python "
-                         "framework for groundwater age dating"),
+    version          = "1.1.0",
+    description      = (
+        "DLPMI: A Differentiable Framework for Lumped Parameter Model "
+        "Inversion and Uncertainty Quantification in Groundwater Age Dating"
+    ),
     long_description = open("README.md").read(),
     long_description_content_type = "text/markdown",
     author           = "DLPMI Development Team",
@@ -16,7 +18,7 @@ setup(
         "numpy>=1.23",
         "scipy>=1.9",
     ],
-    extras_require   = {
+    extras_require = {
         "plot": ["matplotlib>=3.6"],
         "dev":  ["pytest", "pytest-cov"],
     },
