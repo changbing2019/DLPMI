@@ -82,14 +82,25 @@ def hessian_uncertainty(loss_fn_direct,
         lambda p: loss_fn_direct(p.float()).double(), p64
     ).detach().numpy()
 
+    # The factor of 2 is required and was missing before 2026-08-24.
+    #
+    # H here is the Hessian of chi2 itself, d2(chi2)/dtheta_i dtheta_j. For
+    # chi2 = sum(r^2) the Gauss-Newton Hessian is H ~= 2 J^T J, so the
+    # curvature matrix that enters the covariance is H/2, not H:
+    #
+    #     Cov = s^2 (J^T J)^-1 = 2 s^2 H^-1,    s^2 = chi2/dof
+    #
+    # Equivalently, Delta-chi2 = 1 on a quadratic gives a half-width of
+    # sqrt(2/H), not sqrt(1/H). Omitting the 2 made every sigma low by
+    # sqrt(2) = 1.4142. Verified against a closed-form OLS problem in
+    # tests/test_hessian_covariance.py, which reproduces the exact factor.
+    scale = 2.0 * (chi2_val / dof)
     try:
-        Hinv   = np.linalg.inv(H)
-        cov    = Hinv * (chi2_val / dof)
-        sigmas = np.sqrt(np.abs(np.diag(cov)))
+        Hinv = np.linalg.inv(H)
     except np.linalg.LinAlgError:
-        Hinv   = np.linalg.pinv(H)
-        cov    = Hinv * (chi2_val / dof)
-        sigmas = np.sqrt(np.abs(np.diag(cov)))
+        Hinv = np.linalg.pinv(H)
+    cov    = Hinv * scale
+    sigmas = np.sqrt(np.abs(np.diag(cov)))
 
     return sigmas, cov, dof
 
@@ -123,10 +134,20 @@ def profile_uncertainty(loss_fn_1d,
     """
     threshold = chi2_min + delta_chi2
 
-    def _bisect(a, b):
+    def _bisect(inside, outside):
+        """Crossing of `threshold` between `inside` (chi2 <= threshold) and
+        `outside` (chi2 > threshold). Either may be numerically larger; only
+        the roles matter.
+
+        The roles are asserted because getting them backwards fails silently:
+        the loop marches one endpoint onto the other and returns it. That is
+        what the lower-bound call did before 2026-08-23, quantising every
+        lower bound to an exact multiple of `step`."""
+        assert loss_fn_1d(inside) <= threshold < loss_fn_1d(outside), (
+            "_bisect called with its endpoints reversed")
+        a, b = inside, outside
         for _ in range(n_bisect):
             mid = 0.5 * (a + b)
-            (b if loss_fn_1d(mid) > threshold else a).__class__  # dummy
             if loss_fn_1d(mid) > threshold: b = mid
             else: a = mid
         return 0.5 * (a + b)
@@ -148,7 +169,7 @@ def profile_uncertainty(loss_fn_1d,
     while lo68 - step > param_lo:
         lo68 -= step
         if loss_fn_1d(lo68) > threshold:
-            lo68 = _bisect(lo68, lo68 + step); found = True; break
+            lo68 = _bisect(lo68 + step, lo68); found = True; break
     if not found:
         lo68 = max(param_lo, param_opt * 0.1)
 

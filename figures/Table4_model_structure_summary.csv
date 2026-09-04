@@ -1,0 +1,6 @@
+Zone,Assigned structure,n assessable,Supported,Contradicted,Indistinguishable,|dAICc| >= 10,dAICc range
+unconfined,DM,19,1,9,9,7,-177.3 to 5.0
+unconfined,BMM-DM-DM,2,2,0,0,2,-41.6 to -23.1
+confined,DM,11,1,7,3,4,-70.8 to 4.6
+confined,BMM-DM-DM,12,12,0,0,12,-869.7 to -13.7
+all,both,44,16,16,12,25,-869.7 to 5.0

@@ -1,0 +1,27 @@
+# Minimum versions the code is written against.
+torch>=2.0
+numpy>=1.24
+pandas>=2.0
+scipy>=1.10
+matplotlib>=3.7
+openpyxl>=3.1
+
+# ---------------------------------------------------------------------------
+# Exact versions every reported result was produced and verified under
+# (2026-08-23, CPU, Windows 11 / Python 3.12). Fitting is deterministic and
+# bit-identical across repeat runs within a fixed environment, but the
+# optimiser's low-order digits are not guaranteed identical across torch
+# versions. If you need the published numbers to the last digit, install these:
+#
+#     torch==2.7.0
+#     numpy==2.3.5
+#     pandas==2.3.3
+#     scipy==1.16.3
+#
+# Then confirm the environment before running anything downstream:
+#
+#     python verify_setup.py
+#
+# It must print tau1 = 29.57 yr and chi2 = 0.045 for EDTRPAS1-36. If it does
+# not, the package tree or the numerical environment differs from the one the
+# published results came from and nothing downstream is comparable.

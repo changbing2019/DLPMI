@@ -14,7 +14,7 @@ Three-file architecture
 
 Uncertainty methods (all at the PINN optimum)
 ----------------------------------------------
-  Hessian (H)  : sigma = sqrt(chi2/dof * diag(inv(H)))
+  Hessian (H)  : sigma = sqrt(2 * chi2/dof * diag(inv(H)))
                  Equivalent to LM covariance used by TracerLPM.
                  Fast, assumes locally parabolic chi2 surface.
 
@@ -42,7 +42,7 @@ Outputs (./outputs/edwards_pinn/ by default)
   00_summary_table.csv         full comparison + all uncertainty estimates
 """
 
-import argparse, json, os, csv as _csv, sys, warnings, traceback as _tb
+import argparse, json, os, csv as _csv, sys, warnings, traceback as _tb, time
 import torch
 import numpy as np
 import matplotlib; matplotlib.use("Agg")
@@ -58,18 +58,41 @@ sys.path.insert(0, os.path.join(_HERE, '..', '..'))
 from dlpmi.tracers    import LAMBDA_3H, LAMBDA_14C
 from dlpmi.kernels    import AGES_YOUNG, AGES_OLD, g_DM, choose_ages
 from dlpmi.forward    import forward_single as _fwd_single
-from dlpmi.forward    import forward_BMM
+from dlpmi.forward    import forward_BMM as _forward_BMM_pkg
 from dlpmi.uncertainty import (chi2_probability, hessian_uncertainty,
                                 profile_uncertainty, mc_uncertainty)
 
 # Local compatibility shims so existing Edwards code still runs unchanged
-from dlpmi.params   import DLPMIModel as PINN_DM, BMMModel as PINN_BMM
+#from dlpmi.params   import DLPMIModel as PINN_DM, BMMModel as PINN_BMM
+from dlpmi.params   import PINN_DM, PINN_BMM
 
+from dlpmi.inverter import print_device_info
+print_device_info()   # confirms which GPU is being used
 def forward_DM(tau, PD, sample_date, tracer_list, scale_list,
                he4_rate=1e-12, ages=None, dgmeta=None):
     return _fwd_single("DM", {"tau": tau, "PD": PD},
                         sample_date, tracer_list, scale_list,
                         he4_rate, ages, dgmeta)
+
+
+def forward_BMM(t1, p1, f1, t2, p2, sample_date, tracer_list, scale_list,
+                he4_rate=1e-12, dic_c1=100., dic_c2=100.,
+                uz_tt=0., dgmeta=None):
+    """Backward-compatible flat-signature wrapper around the refactored
+    dlpmi.forward.forward_BMM, which now expects structured arguments
+    (model1, params1_dict, model2, params2_dict, f1, ...).
+
+    Edwards BMM is always DM (young) + DM (old).  Scalars are coerced to
+    tensors so both the trainable path (tensors) and the final-sims path
+    (Python floats) work, while autograd is preserved for tensor inputs."""
+    def _t(x):
+        return x if torch.is_tensor(x) else torch.tensor(float(x),
+                                                          dtype=torch.float32)
+    return _forward_BMM_pkg(
+        "DM", {"tau": _t(t1), "PD": _t(p1)},
+        "DM", {"tau": _t(t2), "PD": _t(p2)},
+        _t(f1), sample_date, tracer_list, scale_list,
+        he4_rate, dic_c1, dic_c2, uz_tt, dgmeta)
 
 def chi2_loss(sims, obs_vals):
     import torch
@@ -138,13 +161,23 @@ def _parse_free_params(s):
     return str(s["lpm"].get("free_params") or "Mean Age").lower()
 
 
+def _bmm_free_flags(fp):
+    """Token-based free-parameter detection for a BMM, matching the
+    convention in dlpmi.params.BMMModel.  Splitting on commas prevents
+    the substring 'mean age' inside '2nd mean age' from falsely marking
+    τ₁ as free (Mode C: optimise f₁ and τ₂; τ₁ fixed)."""
+    toks = [t.strip() for t in str(fp).lower().split(",")]
+    tau1_free = "mean age" in toks
+    f1_free   = any("fraction" in t for t in toks)
+    tau2_free = any(("2nd" in t or "second" in t) for t in toks)
+    return tau1_free, f1_free, tau2_free
+
+
 def _count_free_params(s):
     lpm = s["lpm"]["name"]
     if lpm == "DM":
         return 2
-    fp = _parse_free_params(s)
-    return sum(["mean age" in fp, "fraction" in fp,
-                "2nd" in fp or "second" in fp])
+    return sum(_bmm_free_flags(_parse_free_params(s)))
 
 
 # ════════════════════════════════════════════════════════════
@@ -182,7 +215,10 @@ def _run_fit(s, tns_a, obs_a, scls_a, he4r, dic_c1, dic_c2,
     best_loss = float("inf"); best_model = None; best_hist = []
 
     if lpm_name == "DM":
-        for tau0 in _seed_tau(tau1_0):
+        for i, tau0 in enumerate(_seed_tau(tau1_0), start=1):
+            print(f"      Start {i}/{n_starts} — training {lpm_name} "
+                  f"(sample={s['sample_id']}, Adam={n_adam}, seed_tau={tau0:.3f})")
+            t_start = time.perf_counter()
             m  = PINN_DM(tau0, pd1_0, tau1_lo, tau1_hi, pd1_lo, pd1_hi)
             def lfn(m=m):
                 tau, pd = m.get_params()
@@ -191,28 +227,42 @@ def _run_fit(s, tns_a, obs_a, scls_a, he4r, dic_c1, dic_c2,
                                             ages=ag, dgmeta=dgmeta), obs_a)
             h  = train_pinn(m, lfn, n_adam)
             fl = lfn().item()
+            elapsed = time.perf_counter() - t_start
+            tv, pv = m.get_params()
+            print(f"      Start {i}/{n_starts} done: "
+                  f"τ={tv.item():.3f} PD={pv.item():.5f} χ²={fl:.5f} "
+                  f"({elapsed:.1f}s)")
             if verbose:
-                tv, pv = m.get_params()
                 print(f"      τ₀={tau0:.1f} → τ={tv.item():.3f} PD={pv.item():.5f} χ²={fl:.5f}")
             if fl < best_loss: best_loss=fl; best_model=m; best_hist=h
 
     else:
         tau2_v  = float(lpm_r.get("tau2_yr") or tau2_0)
         t1_hi_b = min(tau1_hi, tau2_v*0.9); t1_hi_b = max(t1_hi_b, tau1_lo*2.)
-        for tau0, f0 in zip(_seed_tau(tau1_0), _seed_f(f1_0)):
+        for i, (tau0, f0) in enumerate(zip(_seed_tau(tau1_0), _seed_f(f1_0)), start=1):
+            print(f"      Start {i}/{n_starts} — training {lpm_name} "
+                  f"(sample={s['sample_id']}, Adam={n_adam}, "
+                  f"seed_tau1={tau0:.3f}, seed_f1={f0:.4f})")
+            t_start = time.perf_counter()
             m = PINN_BMM(fp,
                          float(np.clip(tau1_0, tau1_lo*1.02, t1_hi_b*0.98)),
                          pd1_0, float(f0), tau2_v, pd2_0,
                          tau1_lo, t1_hi_b, f1_lo, f1_hi,
                          tau2_lo=max(1., tau2_v*0.05),
                          tau2_hi=tau2_v*5.)
+            uz_tt = float(s["lpm"].get("uz_tt_yr") or 0.)
             def lfn(m=m):
                 t1,p1,f1,t2,p2 = m.get_params()
-                return chi2_loss(forward_BMM(t1,p1,f1,t2,p2,sd,tns_a,scls_a,he4r,dic_c1,dic_c2), obs_a)
+                return chi2_loss(forward_BMM(t1,p1,f1,t2,p2,sd,tns_a,scls_a,he4r,dic_c1,dic_c2,
+                                              uz_tt=uz_tt, dgmeta=dgmeta), obs_a)
             h  = train_pinn(m, lfn, n_adam)
             fl = lfn().item()
+            elapsed = time.perf_counter() - t_start
+            t1,_,f1,t2,_ = m.get_params()
+            print(f"      Start {i}/{n_starts} done: "
+                  f"τ₁={t1.item():.3f} f₁={f1.item():.4f} τ₂={t2.item():.3f} "
+                  f"χ²={fl:.5f} ({elapsed:.1f}s)")
             if verbose:
-                t1,_,f1,t2,_ = m.get_params()
                 print(f"      τ₁₀={tau0:.1f} f₀={f0:.3f} → τ₁={t1.item():.3f} f₁={f1.item():.4f} χ²={fl:.5f}")
             if fl < best_loss: best_loss=fl; best_model=m; best_hist=h
 
@@ -222,12 +272,16 @@ def _run_fit(s, tns_a, obs_a, scls_a, he4r, dic_c1, dic_c2,
 # ════════════════════════════════════════════════════════════
 # UNCERTAINTY HELPERS
 # ════════════════════════════════════════════════════════════
-def _compute_hessian(s, model, tns_a, obs_a, scls_a, he4r, dic_c1, dic_c2, chi2_val):
+def _compute_hessian(s, model, tns_a, obs_a, scls_a, he4r, dic_c1, dic_c2, chi2_val,
+                      dgmeta=None):
     """Compute Hessian-based 1-sigma uncertainties."""
+    if dgmeta is None:
+        dgmeta = {}
     sd = float(s["sample_date"])
     lpm = s["lpm"]["name"]
     n_free = _count_free_params(s)
     n_act  = sum(1 for t in s["tracers"] if t.get("scale", 0) != 0)
+    uz_tt  = float(s["lpm"].get("uz_tt_yr") or 0.)
 
     if lpm == "DM":
         tau_v, pd_v = [p.item() for p in model.get_params()]
@@ -239,7 +293,8 @@ def _compute_hessian(s, model, tns_a, obs_a, scls_a, he4r, dic_c1, dic_c2, chi2_
 
         def lfn_direct(p):
             ag = AGES_OLD if float(p[0].detach()) > 500. else AGES_YOUNG
-            return chi2_loss(forward_DM(p[0], p[1], sd, tns_a, scls_a, he4r, ages=ag), obs_a)
+            return chi2_loss(forward_DM(p[0], p[1], sd, tns_a, scls_a, he4r, ages=ag,
+                                        dgmeta=dgmeta), obs_a)
 
         sigmas, cov, dof = hessian_uncertainty(lfn_direct, params_opt,
                                                 chi2_val, n_act, n_free)
@@ -249,26 +304,47 @@ def _compute_hessian(s, model, tns_a, obs_a, scls_a, he4r, dic_c1, dic_c2, chi2_
 
     else:
         t1v, p1v, f1v, t2v, p2v = [p.item() for p in model.get_params()]
-        params_opt = torch.tensor([t1v, f1v], dtype=torch.float32)
-        tau1_hi_b  = min(float(s["pinn_bounds"]["tau1_hi"]), t2v*0.9)
-        bounds_lo  = [float(s["pinn_bounds"]["tau1_lo"]), 0.005]
-        bounds_hi  = [tau1_hi_b, 0.997]
         fp = _parse_free_params(s)
+        tau1_free, f1_free, tau2_free = _bmm_free_flags(fp)
 
-        def lfn_direct(p):
-            # Use the free params that were actually optimised
-            tau1 = p[0] if "mean age" in fp else torch.tensor(t1v)
-            f1   = p[1] if "fraction" in fp else torch.tensor(f1v)
+        # Build the ordered list of genuinely free parameters with their
+        # optimum values and bounds. Computing the Hessian over a fixed
+        # parameter would give a degenerate (singular) curvature, so only
+        # the free ones are included. Mode A → (tau1,f1); Mode B → (f1);
+        # Mode C → (f1,tau2).
+        tau1_hi_b = min(float(s["pinn_bounds"]["tau1_hi"]), t2v*0.9)
+        free_specs = []  # (name, value, lo, hi)
+        if tau1_free:
+            free_specs.append(("tau1", t1v,
+                               float(s["pinn_bounds"]["tau1_lo"]), tau1_hi_b))
+        if f1_free:
+            free_specs.append(("f1", f1v, 0.005, 0.997))
+        if tau2_free:
+            free_specs.append(("tau2", t2v, max(1., t2v*0.05), t2v*5.))
+        if not free_specs:   # degenerate safety net
+            free_specs.append(("f1", f1v, 0.005, 0.997))
+
+        param_names = [fs[0] for fs in free_specs]
+        param_vals  = [fs[1] for fs in free_specs]
+        lo_bounds   = [fs[2] for fs in free_specs]
+        hi_bounds   = [fs[3] for fs in free_specs]
+        params_opt  = torch.tensor(param_vals, dtype=torch.float32)
+
+        def lfn_direct(p, _names=param_names):
+            # Map the free-parameter vector back into the 5 BMM arguments,
+            # holding the fixed parameters at their optimum values.
+            d    = {nm: p[i] for i, nm in enumerate(_names)}
+            tau1 = d.get("tau1", torch.tensor(t1v))
+            f1   = d.get("f1",   torch.tensor(f1v))
+            tau2 = d.get("tau2", torch.tensor(t2v))
             return chi2_loss(
                 forward_BMM(tau1, torch.tensor(p1v), f1,
-                            torch.tensor(t2v), torch.tensor(p2v),
-                            sd, tns_a, scls_a, he4r, dic_c1, dic_c2), obs_a)
+                            tau2, torch.tensor(p2v),
+                            sd, tns_a, scls_a, he4r, dic_c1, dic_c2,
+                            uz_tt=uz_tt, dgmeta=dgmeta), obs_a)
 
         sigmas, cov, dof = hessian_uncertainty(lfn_direct, params_opt,
                                                 chi2_val, n_act, n_free)
-        param_names = ["tau1", "f1"]
-        param_vals  = [t1v, f1v]
-        lo_bounds   = bounds_lo; hi_bounds = bounds_hi
 
     return {
         "param_names"  : param_names,
@@ -356,14 +432,21 @@ def _compute_mc(s, model, tns, tns_a, obs_all, obs_errs_all,
                               tau1_lo, t1_hi_b, 0.005, 0.997,
                               tau2_lo=max(1., (t2v or 100.)*0.05),
                               tau2_hi=(t2v or 100.)*5.)
+                uz_tt  = float(s["lpm"].get("uz_tt_yr") or 0.)
+                dgmeta = s.get("dgmeta_params", {}) or {}
                 def lfn(m=m, op=obs_pert):
                     t1,p1,f1,t2,p2 = m.get_params()
                     return chi2_loss(
-                        forward_BMM(t1,p1,f1,t2,p2,sd,tns_a,scls_a,he4r,dic_c1,dic_c2), op)
+                        _forward_BMM_pkg("DM", {"tau": t1, "PD": p1},
+                                        "DM", {"tau": t2, "PD": p2}, f1,
+                                        sd, tns_a, scls_a, he4r, dic_c1, dic_c2,
+                                        uz_tt, dgmeta), op)
                 train_pinn(m, lfn, min(n_adam//5, 800))
                 t1,_,f1,t2,_ = m.get_params()
-                tau1s.append(t1.item()); f1s.append(f1.item())
-                if "2nd" in fp or "second" in fp: tau2s.append(t2.item())
+                tau1_free, f1_free, tau2_free = _bmm_free_flags(fp)
+                if tau1_free: tau1s.append(t1.item())
+                if f1_free:   f1s.append(f1.item())
+                if tau2_free: tau2s.append(t2.item())
         except Exception:
             n_fail += 1
 
@@ -388,7 +471,7 @@ def _compute_mc(s, model, tns, tns_a, obs_all, obs_errs_all,
 # FIT ONE SAMPLE  (main entry point)
 # ════════════════════════════════════════════════════════════
 def fit_sample(s, n_adam=5000, n_starts=3, n_mc=100,
-               do_profile=True, do_mc=True, verbose=False):
+               do_profile=True, do_mc=True, verbose=True):
     """
     Fit one sample and compute three uncertainty estimates.
 
@@ -426,13 +509,16 @@ def fit_sample(s, n_adam=5000, n_starts=3, n_mc=100,
         tau_f, pd_f = best_model.get_params()
         tau1_v=tau_f.item(); pd1_v=pd_f.item(); f1_v=None; tau2_v=None; pd2_v=None
         ag_f = AGES_OLD if tau1_v>500. else AGES_YOUNG
-        sims_f = forward_DM(tau1_v, pd1_v, sd, tns, scls, he4r, ages=ag_f)
+        sims_f = forward_DM(tau1_v, pd1_v, sd, tns, scls, he4r, ages=ag_f,
+                             dgmeta=dgmeta)
     else:
         t1f,p1f,f1f,t2f,p2f = best_model.get_params()
         tau1_v=t1f.item(); pd1_v=p1f.item(); f1_v=f1f.item()
         tau2_v=t2f.item(); pd2_v=p2f.item()
+        uz_tt_f = float(s["lpm"].get("uz_tt_yr") or 0.)
         sims_f = forward_BMM(tau1_v,pd1_v,f1_v,tau2_v,pd2_v,
-                              sd,tns,scls,he4r,dic_c1,dic_c2)
+                              sd,tns,scls,he4r,dic_c1,dic_c2,
+                              uz_tt=uz_tt_f, dgmeta=dgmeta)
 
     # ── chi2 probability ──────────────────────────────────────
     n_act  = sum(act); n_free = _count_free_params(s)
@@ -441,7 +527,8 @@ def fit_sample(s, n_adam=5000, n_starts=3, n_mc=100,
     # ── Hessian uncertainty ───────────────────────────────────
     try:
         hess_info = _compute_hessian(s, best_model, tns_a, obs_a, scls_a,
-                                     he4r, dic_c1, dic_c2, best_loss)
+                                     he4r, dic_c1, dic_c2, best_loss,
+                                     dgmeta=dgmeta)
         unc_hess = {k: hess_info[k]
                     for k in ("param_names","param_vals","sigmas_hess","dof")}
     except Exception as e:
@@ -468,6 +555,8 @@ def fit_sample(s, n_adam=5000, n_starts=3, n_mc=100,
 
     return dict(
         sid=s["sample_id"], lpm=lpm_n,
+        site_no=s.get("site_no"), network=s.get("network"),
+        date=s.get("date"),
         chi2=best_loss, chi2_lpm=lpm_r.get("chi2"),
         chi2_prob=prob, dof=dof,
         tau1=tau1_v, pd1=pd1_v, f1=f1_v, tau2=tau2_v, pd2=pd2_v,
@@ -475,6 +564,7 @@ def fit_sample(s, n_adam=5000, n_starts=3, n_mc=100,
         f1_lpm=lpm_r.get("fraction1"), tau2_lpm=lpm_r.get("tau2_yr"),
         tau1_err_lpm=lpm_r.get("tau1_err"),
         f1_err_lpm  =lpm_r.get("f1_err"),
+        tau2_err_lpm=lpm_r.get("tau2_err"),
         tracer_names=tns, obs_vals=obs_v, obs_errs=obs_e,
         eff_scales=scls, active=act,
         sim_vals=[v.item() for v in sims_f],
@@ -805,11 +895,15 @@ def plot_summary(all_results, out_dir):
                                     xerr=[[min(sg[idx],pinn_v[i]*0.99)],[sg[idx]]],
                                     fmt="none", ecolor="black", capsize=3, lw=1.2,
                                     zorder=5)
-                # MC error bars (P16-P84)
+                # MC error bars (P16-P84) — clamp to >=0; the PINN point
+                # estimate can fall just outside [P16,P84] for poorly
+                # constrained samples, which matplotlib rejects as negative xerr.
                 mc = r.get("unc_mc",{}).get("tau1",{})
                 if mc.get("p16") and mc.get("p84"):
+                    lo_err = max(0.0, pinn_v[i] - mc["p16"])
+                    hi_err = max(0.0, mc["p84"] - pinn_v[i])
                     ax.errorbar(pinn_v[i], y[i]-0.20,
-                                xerr=[[pinn_v[i]-mc["p16"]],[mc["p84"]-pinn_v[i]]],
+                                xerr=[[lo_err],[hi_err]],
                                 fmt="none", ecolor=TEAL, capsize=2, lw=0.8,
                                 alpha=0.6, zorder=4)
 
@@ -896,21 +990,23 @@ def write_tracer_csv(all_results, path):
 
 def write_summary_csv(all_results, path):
     cols = [
-        "SampleID","Date","AgeCat","LPM","n_active","n_free","dof",
+        "SampleID","SiteNo","Network","Date","AgeCat","LPM","n_active","n_free","dof",
         # Best-fit parameters
         "tau1_PINN","pd1_PINN","f1_PINN","tau2_PINN",
         "tau1_LPM","f1_LPM","tau2_LPM",
         # Fit quality
         "chi2_PINN","chi2_LPM","chi2_delta","chi2_prob_PINN","chi2_prob_LPM","PINN_better",
         # Hessian uncertainties
-        "tau1_sigma_hess","f1_sigma_hess","pd1_sigma_hess",
-        "tau1_sigma_LPM","f1_sigma_LPM",
+        "tau1_sigma_hess","f1_sigma_hess","pd1_sigma_hess","tau2_sigma_hess",
+        "tau1_sigma_LPM","f1_sigma_LPM","tau2_sigma_LPM",
         # Profile CI
         "tau1_profile_lo","tau1_profile_hi","tau1_profile_sym",
         "f1_profile_lo","f1_profile_hi","f1_profile_sym",
+        "tau2_profile_lo","tau2_profile_hi","tau2_profile_sym",
         # Monte Carlo
         "tau1_MC_mean","tau1_MC_std","tau1_MC_p16","tau1_MC_p84",
         "f1_MC_mean","f1_MC_std","f1_MC_p16","f1_MC_p84",
+        "tau2_MC_mean","tau2_MC_std","tau2_MC_p16","tau2_MC_p84",
         "MC_n_ok","MC_n_fail",
         # Tracer info
         "Tracer_names","Obs_vals","PINN_sim","LPM_sim",
@@ -943,14 +1039,17 @@ def write_summary_csv(all_results, path):
             dchi2=f"{r['chi2']-chi2_l:+.4f}" if chi2_l else ""
             better="Yes" if chi2_l and r["chi2"]<=chi2_l else ""
 
-            prof_sym_tau=""; prof_sym_f=""
-            pci_t=up.get("tau1"); pci_f=up.get("f1")
+            prof_sym_tau=""; prof_sym_f=""; prof_sym_tau2=""
+            pci_t=up.get("tau1"); pci_f=up.get("f1"); pci_t2=up.get("tau2")
             if isinstance(pci_t,tuple): prof_sym_tau=ff((pci_t[1]-pci_t[0])/2)
             if isinstance(pci_f,tuple): prof_sym_f  =ff((pci_f[1]-pci_f[0])/2)
+            if isinstance(pci_t2,tuple): prof_sym_tau2=ff((pci_t2[1]-pci_t2[0])/2)
 
             obs=r["obs_vals"]; sv=r["sim_vals"]; sl=r.get("sim_lpm") or []
             w.writerow({
                 "SampleID"       :r["sid"],
+                "SiteNo"         :r.get("site_no") or "",
+                "Network"        :r.get("network") or "",
                 "Date"           :ff(r["sample_date"],3),
                 "AgeCat"         :r["age_cat"],
                 "LPM"            :r["lpm"],
@@ -973,14 +1072,19 @@ def write_summary_csv(all_results, path):
                 "tau1_sigma_hess":_sg("tau1"),
                 "f1_sigma_hess"  :_sg("f1"),
                 "pd1_sigma_hess" :_sg("pd1"),
+                "tau2_sigma_hess":_sg("tau2"),
                 "tau1_sigma_LPM" :ff(r.get("tau1_err_lpm")),
                 "f1_sigma_LPM"   :ff(r.get("f1_err_lpm")),
+                "tau2_sigma_LPM" :ff(r.get("tau2_err_lpm")),
                 "tau1_profile_lo":_pci("tau1",0),
                 "tau1_profile_hi":_pci("tau1",1),
                 "tau1_profile_sym":prof_sym_tau,
                 "f1_profile_lo"  :_pci("f1",0),
                 "f1_profile_hi"  :_pci("f1",1),
                 "f1_profile_sym" :prof_sym_f,
+                "tau2_profile_lo":_pci("tau2",0),
+                "tau2_profile_hi":_pci("tau2",1),
+                "tau2_profile_sym":prof_sym_tau2,
                 "tau1_MC_mean"   :_mcs("tau1","mean"),
                 "tau1_MC_std"    :_mcs("tau1","std"),
                 "tau1_MC_p16"    :_mcs("tau1","p16"),
@@ -989,6 +1093,10 @@ def write_summary_csv(all_results, path):
                 "f1_MC_std"      :_mcs("f1","std"),
                 "f1_MC_p16"      :_mcs("f1","p16"),
                 "f1_MC_p84"      :_mcs("f1","p84"),
+                "tau2_MC_mean"   :_mcs("tau2","mean"),
+                "tau2_MC_std"    :_mcs("tau2","std"),
+                "tau2_MC_p16"    :_mcs("tau2","p16"),
+                "tau2_MC_p84"    :_mcs("tau2","p84"),
                 "MC_n_ok"        :str(um.get("n_ok","")),
                 "MC_n_fail"      :str(um.get("n_fail","")),
                 "Tracer_names"   :"; ".join(r["tracer_names"]),
@@ -1015,7 +1123,7 @@ def main():
                         help="Skip profile CI (faster)")
     parser.add_argument("--no-mc",    action="store_true",
                         help="Skip Monte Carlo (faster)")
-    parser.add_argument("--verbose",  action="store_true")
+    parser.add_argument("--verbose",  action="store_true", default=True)
     parser.add_argument("--config",   default=_CONFIG_DEFAULT)
     parser.add_argument("--outdir",   default=_OUT_DIR)
     args = parser.parse_args()
@@ -1039,8 +1147,22 @@ def main():
     print(f"{'='*72}\n")
 
     all_results = []; n_ok=0; n_err=0
+    n_total = len(samples)
+    t_all_start = time.perf_counter()
+    processed_elapsed = []
+
+    def _fmt_time(seconds):
+        seconds = max(0, int(round(float(seconds))))
+        h, rem = divmod(seconds, 3600)
+        m, s = divmod(rem, 60)
+        if h > 0:
+            return f"{h:d}h {m:02d}m {s:02d}s"
+        if m > 0:
+            return f"{m:d}m {s:02d}s"
+        return f"{s:d}s"
 
     for i,s in enumerate(samples):
+        t_sample_start = time.perf_counter()
         tag=(f"[{i+1:2d}/{len(samples)}]  {s['sample_id']:<35}"
              f"  ({s['lpm']['name']}, {s['age_category']})")
         print(tag, end="  ", flush=True)
@@ -1069,17 +1191,36 @@ def main():
             print(f"ERROR — {exc}")
             if args.verbose: _tb.print_exc()
 
+        sample_elapsed = time.perf_counter() - t_sample_start
+        processed_elapsed.append(sample_elapsed)
+        n_done = i + 1
+        elapsed_total = time.perf_counter() - t_all_start
+        avg_per_sample = elapsed_total / max(1, n_done)
+        eta_remaining = avg_per_sample * max(0, n_total - n_done)
+        print(f"      Time: sample={_fmt_time(sample_elapsed)}  "
+              f"total={_fmt_time(elapsed_total)}  "
+              f"ETA remaining ({n_total-n_done} sample(s))={_fmt_time(eta_remaining)}")
+
     print(f"\n{'─'*72}")
     print(f"  {n_ok}/{len(samples)} OK  ({n_err} error(s))")
+    total_elapsed = time.perf_counter() - t_all_start
+    avg_elapsed = (sum(processed_elapsed) / len(processed_elapsed)) if processed_elapsed else 0.0
+    print(f"  Total computation time: {_fmt_time(total_elapsed)}  "
+          f"(avg/sample: {_fmt_time(avg_elapsed)})")
     print(f"{'─'*72}\n")
 
     if not all_results: return
     print("Writing summary outputs ...")
-    plot_summary(all_results, args.outdir)
+    # Write data tables FIRST so a plotting error can never lose them.
     csv_path = os.path.join(args.outdir, "00_summary_table.csv")
     write_summary_csv(all_results, csv_path)
     tracer_csv  = os.path.join(args.outdir, "00_tracer_detail.csv")
     write_tracer_csv(all_results, tracer_csv)
+    try:
+        plot_summary(all_results, args.outdir)
+    except Exception as exc:
+        print(f"  WARNING — summary figure failed ({exc}); CSVs were still written.")
+        if args.verbose: _tb.print_exc()
     print(f"  Tracer  → {tracer_csv}")
     print(f"  Summary → {args.outdir}/00_summary_all_samples.png")
     print(f"  CSV     → {csv_path}")

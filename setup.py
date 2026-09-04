@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name             = "dlpmi",
-    version          = "1.1.0",
+    version="2.0.0",
     description      = (
         "DLPMI: A Differentiable Framework for Lumped Parameter Model "
         "Inversion and Uncertainty Quantification in Groundwater Age Dating"

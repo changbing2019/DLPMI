@@ -1,0 +1,27 @@
+{
+  "title": "DLPMI: Differentiable Lumped-Parameter Model Inversion for Environmental Tracer Data",
+  "description": "Lumped-parameter model inversion for environmental tracer data using automatic differentiation, with identifiability, tracer information-content, model-structure and scale-marginalised Bayesian diagnostics. Version 2.0.0 corrects three defects in 1.0.0 that changed numerical output; see CHANGELOG.md.",
+  "license": "MIT",
+  "upload_type": "software",
+  "creators": [
+    {
+      "name": "Yang, Changbing",
+      "affiliation": "Environmental Data Techniques, Inc."
+    }
+  ],
+  "keywords": [
+    "groundwater age",
+    "environmental tracers",
+    "lumped-parameter models",
+    "identifiability",
+    "automatic differentiation",
+    "karst"
+  ],
+  "related_identifiers": [
+    {
+      "identifier": "10.5066/P9CWM574",
+      "relation": "isDerivedFrom",
+      "resource_type": "dataset"
+    }
+  ]
+}

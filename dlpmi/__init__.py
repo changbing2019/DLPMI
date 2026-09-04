@@ -54,8 +54,10 @@ from .params    import DLPMIModel, BMMModel
 from .inverter  import Inverter, Sample
 from .uncertainty import (chi2_probability, hessian_uncertainty,
                            profile_uncertainty, mc_uncertainty)
+from .metrics   import (young_fraction, mixture_mean_age, delta_method_sigma,
+                         gaussian_propagate, mc_metric, exit_age_grid)
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 __all__ = [
     # Tracer functions
     "input_3H", "input_SF6", "input_14C", "input_4He",
@@ -72,4 +74,9 @@ __all__ = [
     # Uncertainty
     "chi2_probability", "hessian_uncertainty",
     "profile_uncertainty", "mc_uncertainty",
+    # Derived metrics
+    "young_fraction", "mixture_mean_age", "delta_method_sigma",
+    "gaussian_propagate", "mc_metric", "exit_age_grid",
 ]
+
+from .inverter import print_device_info, DEVICE

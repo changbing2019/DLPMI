@@ -214,8 +214,13 @@ class BMMModel(nn.Module):
         tau1_0 = float(params1_init.get("tau", 20.))
         tau2_0 = float(params2_init.get("tau", 1000.))
 
+        # Parse free_params as comma-separated tokens so that the
+        # substring "mean age" inside "2nd mean age" cannot falsely
+        # mark τ₁ as free (Mode C: optimise f₁ and τ₂; τ₁ fixed).
+        _free_toks = [t.strip() for t in self._free.split(",")]
+
         # ── τ₁ ─────────────────────────────────────────────────
-        self._tau1_free = "mean age" in self._free
+        self._tau1_free = "mean age" in _free_toks   # exact token match
         if self._tau1_free:
             self.tau1_lo = float(tau1_lo); self.tau1_hi = float(tau1_hi)
             self.r_tau1  = nn.Parameter(torch.tensor(
@@ -225,7 +230,7 @@ class BMMModel(nn.Module):
             self._tau1_val = tau1_0
 
         # ── f₁ ─────────────────────────────────────────────────
-        self._f1_free = "fraction" in self._free
+        self._f1_free = any("fraction" in t for t in _free_toks)
         if self._f1_free:
             self.f1_lo = float(f1_lo); self.f1_hi = float(f1_hi)
             self.r_f1  = nn.Parameter(torch.tensor(
@@ -235,7 +240,7 @@ class BMMModel(nn.Module):
             self._f1_val = float(f1_0)
 
         # ── τ₂ ─────────────────────────────────────────────────
-        self._tau2_free = "2nd" in self._free or "second" in self._free
+        self._tau2_free = any(("2nd" in t or "second" in t) for t in _free_toks)
         if self._tau2_free:
             if tau2_hi is None:
                 tau2_hi = max(tau2_0 * 5., 200.)
@@ -268,3 +273,82 @@ class BMMModel(nn.Module):
         params2 = {"tau": tau2, **{k: torch.tensor(float(v))
                                    for k, v in self._fixed2.items()}}
         return params1, f1, params2
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BACKWARD-COMPATIBLE WRAPPER CLASSES
+# For scripts written against the pre-v1.3 API where:
+#   PINN_DM(tau0, pd0, tau_lo, tau_hi, pd_lo, pd_hi)
+#   tau, pd = model.get_params()
+#   PINN_BMM(fp, tau1, pd1, f1, tau2, pd2, tau1_lo, tau1_hi, f1_lo, f1_hi, ...)
+#   t1, p1, f1, t2, p2 = model.get_params()
+# ══════════════════════════════════════════════════════════════════════════════
+
+class PINN_DM(nn.Module):
+    """
+    Backward-compatible DM parameter class.
+    Calling convention: PINN_DM(tau0, pd0, tau_lo, tau_hi, pd_lo, pd_hi)
+    get_params() returns (tau_tensor, pd_tensor)
+    """
+    def __init__(self, tau0, pd0,
+                 tau_lo=0.5, tau_hi=1e5,
+                 pd_lo=0.001, pd_hi=2.0):
+        super().__init__()
+        self._inner = DLPMIModel(
+            'DM',
+            tau0=float(tau0), tau_lo=float(tau_lo), tau_hi=float(tau_hi),
+            PD0=float(pd0),   pd_lo=float(pd_lo),   pd_hi=float(pd_hi),
+        )
+
+    def forward(self): return self._inner.forward()
+
+    def get_params(self):
+        p = self._inner.get_params()
+        return p['tau'], p.get('PD', torch.tensor(0.1))
+
+    def parameters(self, recurse=True):
+        return self._inner.parameters(recurse=recurse)
+
+    def zero_grad(self, set_to_none=True):
+        return self._inner.zero_grad(set_to_none=set_to_none)
+
+
+class PINN_BMM(nn.Module):
+    """
+    Backward-compatible BMM-DM-DM parameter class.
+    Calling convention:
+        PINN_BMM(free_params, tau1_0, pd1_0, f1_0, tau2_0, pd2_0,
+                 tau1_lo, tau1_hi, f1_lo, f1_hi,
+                 tau2_lo=1., tau2_hi=None)
+    get_params() returns (tau1, pd1, f1, tau2, pd2) as tensors
+    """
+    def __init__(self, free_params,
+                 tau1_0, pd1_0, f1_0, tau2_0, pd2_0,
+                 tau1_lo, tau1_hi, f1_lo, f1_hi,
+                 tau2_lo=1., tau2_hi=None):
+        super().__init__()
+        tau2_hi_ = float(tau2_hi) if tau2_hi else float(tau2_0) * 5.
+        self._inner = BMMModel(
+            'DM', 'DM',
+            free_params=str(free_params),
+            params1_init={'tau': float(tau1_0), 'PD': float(pd1_0)},
+            params2_init={'tau': float(tau2_0), 'PD': float(pd2_0)},
+            f1_0=float(f1_0),
+            tau1_lo=float(tau1_lo), tau1_hi=float(tau1_hi),
+            f1_lo=float(f1_lo),    f1_hi=float(f1_hi),
+            tau2_lo=float(tau2_lo), tau2_hi=tau2_hi_,
+        )
+
+    def forward(self): return self._inner.forward()
+
+    def get_params(self):
+        p1, f1, p2 = self._inner.get_params()
+        tau1 = p1['tau']; pd1 = p1.get('PD', torch.tensor(0.1))
+        tau2 = p2['tau']; pd2 = p2.get('PD', torch.tensor(0.1))
+        return tau1, pd1, f1, tau2, pd2
+
+    def parameters(self, recurse=True):
+        return self._inner.parameters(recurse=recurse)
+
+    def zero_grad(self, set_to_none=True):
+        return self._inner.zero_grad(set_to_none=set_to_none)

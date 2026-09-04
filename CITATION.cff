@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using these metadata."
+title: "DLPMI: Differentiable Lumped-Parameter Model Inversion for Environmental Tracer Data"
+abstract: >-
+  Lumped-parameter model inversion for environmental tracer data using
+  automatic differentiation rather than finite-difference Jacobians, with
+  identifiability, tracer information-content, model-structure and Bayesian
+  diagnostics.
+authors:
+  - family-names: Yang
+    given-names: Changbing
+    affiliation: "Environmental Data Techniques, Inc."
+    email: yangcb@gmail.com
+version: 2.0.0
+license: MIT
+repository-code: "https://github.com/changbing2019/DLPMI"
+keywords:
+  - groundwater age
+  - environmental tracers
+  - lumped-parameter models
+  - identifiability
+  - automatic differentiation

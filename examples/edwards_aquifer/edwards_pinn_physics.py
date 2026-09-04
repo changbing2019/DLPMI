@@ -418,7 +418,7 @@ def train_pinn(model, loss_fn, n_adam=5000, lr_adam=3e-3, lr_lbfgs=0.02):
 # Three complementary methods, all evaluated at the PINN optimum:
 #
 # 1. Hessian-based (analytical)
-#    cov = inv(H) * chi2/dof   where H = d²chi2/d(theta)²
+#    cov = 2 * inv(H) * chi2/dof   where H = d²chi2/d(theta)²
 #    sigma_i = sqrt(cov[i,i])
 #    Equivalent to Levenberg-Marquardt covariance used by TracerLPM.
 #    Fast (one autograd Hessian call).  Assumes a locally parabolic surface.
@@ -493,12 +493,12 @@ def hessian_uncertainty(loss_fn_direct, params_opt, chi2_val,
 
     try:
         Hinv = np.linalg.inv(H)
-        cov  = Hinv * (chi2_val / dof)
+        cov  = Hinv * (2.0 * chi2_val / dof)     # factor 2: see dlpmi/uncertainty.py
         sigmas = np.sqrt(np.abs(np.diag(cov)))
     except np.linalg.LinAlgError:
         # Singular Hessian → use pseudo-inverse
         Hinv   = np.linalg.pinv(H)
-        cov    = Hinv * (chi2_val / dof)
+        cov    = Hinv * (2.0 * chi2_val / dof)   # factor 2: see dlpmi/uncertainty.py
         sigmas = np.sqrt(np.abs(np.diag(cov)))
 
     return sigmas, cov, dof
